@@ -1,4 +1,5 @@
 import torch
+from collections import defaultdict
 from typing import Any
 from trl import SFTTrainer
 from utils.instructions import create_tokens_labels
@@ -27,10 +28,12 @@ class Qwen3_5Collator:
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         batch_input_ids: list[list[int]] = []
         batch_labels: list[list[int]] = []
+        subsets: list[str] = []
         max_len = 0
         pad_id = self.tokenizer.pad_token_id
         for feat in features:
             messages = feat["messages"]
+            subsets.append(feat.get("subset", ""))
 
             full_ids, _, labels = create_tokens_labels(
                 self.tokenizer,
@@ -56,6 +59,7 @@ class Qwen3_5Collator:
             "input_ids": torch.tensor(padded_input, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(padded_labels, dtype=torch.long),
+            "subset": subsets,
         }
         return batch
 
@@ -74,6 +78,74 @@ class Mytrainer(SFTTrainer):
         # 2. Force SFTTrainer to use your custom collator, overriding its fallback
         if custom_collator is not None:
             self.data_collator = custom_collator
+
+        # Ensure TRL's _metrics dict exists (guaranteed by SFTTrainer, but guard anyway)
+        if not hasattr(self, "_metrics"):
+            self._metrics = defaultdict(list)
+
+        # Accumulate raw token counts across all micro-batches (grad-accum steps)
+        # and flush them to ratios only at logging time, so every token has equal weight.
+        self._overall_metrics: dict[str, int] = {"correct": 0, "total": 0}
+        self._lang_metrics: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"correct": 0, "total": 0}
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        subsets: list[str] | None = inputs.pop("subset", None)
+
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        loss = outputs.loss / self.args.gradient_accumulation_steps
+
+        # Token-prediction accuracy over the answer spans (non-masked positions)
+        if labels is not None and outputs.logits is not None:
+            logits = outputs.logits          # (B, T, V)
+            # Causal-LM shift: logit at t predicts label at t+1
+            shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
+            shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
+
+            mask = shift_labels != -100
+            total_tokens = mask.sum().item()
+
+            if total_tokens > 0:
+                preds = shift_logits.argmax(dim=-1)
+                correct = (preds == shift_labels) & mask
+
+                # Accumulate raw counts so every token has equal weight across
+                # all micro-batches in a gradient-accumulation window.
+                self._overall_metrics["correct"] += correct.sum().item()
+                self._overall_metrics["total"] += total_tokens
+
+                # Accumulate per-language raw counts
+                if subsets is not None:
+                    for i, subset in enumerate(subsets):
+                        lang = subset.split("_")[0] if subset else "unknown"
+                        n_tokens = mask[i].sum().item()
+                        n_correct = correct[i].sum().item()
+                        if n_tokens > 0:
+                            self._lang_metrics[lang]["correct"] += n_correct
+                            self._lang_metrics[lang]["total"] += n_tokens
+
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: dict, **kwargs):
+        # Flush accumulated raw counts → ratios into TRL's _metrics dict.
+        # Doing this here (not inside compute_loss) ensures all micro-batches
+        # in a gradient-accumulation window are combined before the ratio is
+        # computed, so every token carries equal weight.
+        if self._overall_metrics["total"] > 0:
+            self._metrics["token_accuracy"].append(
+                self._overall_metrics["correct"] / self._overall_metrics["total"]
+            )
+        self._overall_metrics = {"correct": 0, "total": 0}
+
+        for lang, stats in self._lang_metrics.items():
+            if stats["total"] > 0:
+                self._metrics[f"token_accuracy_{lang}"].append(
+                    stats["correct"] / stats["total"]
+                )
+        self._lang_metrics.clear()
+        super().log(logs, **kwargs)
 
     def get_train_dataloader(self):
        
