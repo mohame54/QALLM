@@ -1,7 +1,3 @@
-"""
-Evaluate or generate predictions on CSV data using Unsloth + the same
-prompt format as training (`process_single_row` from `utils.datasets`).
-"""
 from __future__ import annotations
 
 import argparse
@@ -39,15 +35,25 @@ def _load_gen_kwargs(path: str | None) -> dict[str, Any]:
 
 
 def _filter_generate_kwargs(model: Any, user_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Keep only kwargs accepted by this model's `generate` (avoids TypeError)."""
+    """Keep only kwargs accepted by this model's `generate` (avoids TypeError).
+
+    If the generate signature contains a **kwargs catch-all, all user kwargs are
+    forwarded — Unsloth's inference wrapper does this, so we must not filter them.
+    """
     gen_fn = getattr(model, "generate", None)
     if gen_fn is None:
         return {}
     try:
         sig = inspect.signature(gen_fn)
-        allowed = set(sig.parameters)
     except (TypeError, ValueError):
         return dict(user_kwargs)
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    if has_var_keyword:
+        return dict(user_kwargs)
+    allowed = set(sig.parameters)
     return {k: v for k, v in user_kwargs.items() if k in allowed}
 
 
@@ -66,21 +72,47 @@ def _ensure_pad_token(hf_tokenizer: Any) -> None:
 
 
 def _tokenize_prompt(messages: list, hf_tokenizer: Any) -> torch.Tensor:
-    """Apply chat template and return a 1-D input_ids tensor."""
+    """Apply chat template and return a 1-D input_ids tensor.
+
+    When messages end with an assistant turn (the ##Answer: prefix), we must
+    use continue_final_message=True so the template leaves that turn open for
+    the model to continue, rather than closing it and opening a second one.
+    """
+    last_role = messages[-1]["role"] if messages and isinstance(messages[-1], dict) else None
+    has_assistant_prefix = last_role == "assistant"
+
     try:
-        ids = hf_tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
+        if has_assistant_prefix:
+            ids = hf_tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=False,
+                continue_final_message=True,
+                tokenize=True,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+        else:
+            ids = hf_tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
     except TypeError:
-        ids = hf_tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
+        if has_assistant_prefix:
+            ids = hf_tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=False,
+                continue_final_message=True,
+                return_tensors="pt",
+            )
+        else:
+            ids = hf_tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
     if isinstance(ids, dict):
         ids = ids["input_ids"]
     return ids.squeeze(0)  # (seq_len,)
@@ -199,17 +231,25 @@ def run_eval(args: argparse.Namespace) -> None:
 
     gen_path = args.gen_kwargs_path or DEFAULT_GEN_KWARGS_PATH
     gen_from_file = _load_gen_kwargs(gen_path)
-    cli_max = {"max_new_tokens": args.max_new_tokens}
-    gen_kwargs = {**gen_from_file, **cli_max}
-    # CLI max_new_tokens wins if also in file
-    gen_kwargs["max_new_tokens"] = args.max_new_tokens
+    # CLI max_new_tokens always wins over the JSON file value.
+    gen_kwargs = {**gen_from_file, "max_new_tokens": args.max_new_tokens}
 
     model, _tokenizer, hf_tokenizer = load_unsloth_model(args.model_id, dtype=args.dtype)
     if args.adapter_path:
         try:
             from peft import PeftModel
 
-            model = PeftModel.from_pretrained(model, args.adapter_path)
+            # Support HF Hub subfolder paths like "org/repo/subfolder".
+            # PeftModel.from_pretrained expects (repo_id, subfolder=...) separately.
+            _parts = args.adapter_path.split("/")
+            if len(_parts) > 2:
+                _adapter_repo = "/".join(_parts[:2])
+                _adapter_subfolder = "/".join(_parts[2:])
+                model = PeftModel.from_pretrained(
+                    model, _adapter_repo, subfolder=_adapter_subfolder
+                )
+            else:
+                model = PeftModel.from_pretrained(model, args.adapter_path)
         except ImportError as exc:
             raise RuntimeError(
                 "peft is required when --adapter_path is set. Install peft or omit adapter_path."

@@ -34,6 +34,8 @@ Reference answer (use it to ground your response):
 
 
 def strip_qwen_thinking_tokens(text: str) -> str:
+    """Remove <think>…</think> blocks emitted by Qwen reasoning models."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return text.strip()
 
 def create_question(

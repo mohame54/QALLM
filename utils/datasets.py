@@ -23,7 +23,6 @@ def _compute_language_allocations(
     effective_batch_size: int,
     alpha: float,
 ) -> dict[str, int]:
-    """Temperature slot allocation: p_i ∝ count_i^alpha, at least 1 slot per language."""
     langs = sorted(lang_counts.keys())
     counts = np.array([lang_counts[lang] for lang in langs], dtype=np.float64)
     weights = counts ** alpha

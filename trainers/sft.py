@@ -13,7 +13,6 @@ class Qwen3_5Collator:
         self,
         tokenizer: Any,
         max_seq_length: int,
-        to_replace="<|im_start|>assistant\n<think>\n\n</think>\n\n",
         answer_start_text="##Answer:",
         chat_template_kwargs=None,
     ) -> None:
@@ -22,7 +21,6 @@ class Qwen3_5Collator:
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.to_replace = to_replace
         self.answer_start_text = answer_start_text
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
@@ -39,7 +37,8 @@ class Qwen3_5Collator:
                 self.tokenizer,
                 messages,
                 answer_start_txt=self.answer_start_text,
-                tokenize=True
+                tokenize=True,
+                enable_thinking=False,
             )
             batch_input_ids.append(full_ids)
             batch_labels.append(labels)
@@ -78,10 +77,6 @@ class Mytrainer(SFTTrainer):
         # 2. Force SFTTrainer to use your custom collator, overriding its fallback
         if custom_collator is not None:
             self.data_collator = custom_collator
-
-        # Ensure TRL's _metrics dict exists (guaranteed by SFTTrainer, but guard anyway)
-        if not hasattr(self, "_metrics"):
-            self._metrics = defaultdict(list)
 
         # Accumulate raw token counts across all micro-batches (grad-accum steps)
         # and flush them to ratios only at logging time, so every token has equal weight.
@@ -130,24 +125,30 @@ class Mytrainer(SFTTrainer):
                                 self._lang_metrics[lang]["correct"] += n_correct
                                 self._lang_metrics[lang]["total"] += n_tokens
         except (NotImplementedError, AttributeError):
+            print("Logits unavailable (unsloth EmptyLogits); skipping accuracy")
             pass  # logits unavailable (unsloth EmptyLogits); skip accuracy
 
         return (loss, outputs) if return_outputs else loss
 
-    def log(self, logs: dict, **kwargs):
+    def log(self, logs: dict, start_time: float | None = None, **kwargs):
+        # Flush accumulated raw counts → ratios and merge directly into logs.
+        # SFTTrainer does NOT override log(), so _metrics is never consumed
+        # by the parent chain — we must inject the values into logs ourselves.
         if self._overall_metrics["total"] > 0:
-            self._metrics["token_accuracy"].append(
+            logs["token_accuracy"] = (
                 self._overall_metrics["correct"] / self._overall_metrics["total"]
             )
         self._overall_metrics = {"correct": 0, "total": 0}
 
         for lang, stats in self._lang_metrics.items():
             if stats["total"] > 0:
-                self._metrics[f"token_accuracy_{lang}"].append(
-                    stats["correct"] / stats["total"]
-                )
+                logs[f"token_accuracy_{lang}"] = stats["correct"] / stats["total"]
         self._lang_metrics.clear()
-        super().log(logs, **kwargs)
+
+        if start_time is not None:
+            super().log(logs, start_time, **kwargs)
+        else:
+            super().log(logs, **kwargs)
 
     def get_train_dataloader(self):
        
