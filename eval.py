@@ -1,0 +1,385 @@
+"""
+Evaluate or generate predictions on CSV data using Unsloth + the same
+prompt format as training (`process_single_row` from `utils.datasets`).
+"""
+from __future__ import annotations
+
+import argparse
+import inspect
+import json
+import os
+from typing import Any
+
+import pandas as pd
+import torch
+import tqdm
+from unsloth import FastLanguageModel
+
+from utils.common import download_gdown_file
+from utils.datasets import process_single_row
+from utils.instructions import strip_qwen_thinking_tokens
+from utils.metrics import calculate_rouge_score
+from utils.model import load_unsloth_model
+
+CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_GEN_KWARGS_PATH = os.path.join(CUR_DIR, "configs", "gen.json")
+
+
+def _load_gen_kwargs(path: str | None) -> dict[str, Any]:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return {}
+        return json.loads(raw)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _filter_generate_kwargs(model: Any, user_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep only kwargs accepted by this model's `generate` (avoids TypeError)."""
+    gen_fn = getattr(model, "generate", None)
+    if gen_fn is None:
+        return {}
+    try:
+        sig = inspect.signature(gen_fn)
+        allowed = set(sig.parameters)
+    except (TypeError, ValueError):
+        return dict(user_kwargs)
+    return {k: v for k, v in user_kwargs.items() if k in allowed}
+
+
+def _model_device(model: Any) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _ensure_pad_token(hf_tokenizer: Any) -> None:
+    """Set pad_token to eos_token when the tokenizer has none (common for Qwen/LLaMA)."""
+    if hf_tokenizer.pad_token_id is None:
+        hf_tokenizer.pad_token = hf_tokenizer.eos_token
+        hf_tokenizer.pad_token_id = hf_tokenizer.eos_token_id
+
+
+def _tokenize_prompt(messages: list, hf_tokenizer: Any) -> torch.Tensor:
+    """Apply chat template and return a 1-D input_ids tensor."""
+    try:
+        ids = hf_tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+    except TypeError:
+        ids = hf_tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+    if isinstance(ids, dict):
+        ids = ids["input_ids"]
+    return ids.squeeze(0)  # (seq_len,)
+
+
+@torch.inference_mode()
+def generate_batch(
+    rows: list[pd.Series],
+    model: Any,
+    hf_tokenizer: Any,
+    start_answer_txt: str,
+    gen_kwargs: dict[str, Any],
+) -> list[str]:
+    """Tokenize a batch of CSV rows with left-padding, run a single `generate` call,
+    return decoded new tokens (prompt stripped) for each row."""
+    _ensure_pad_token(hf_tokenizer)
+
+    prompt_ids: list[torch.Tensor] = []
+    for row in rows:
+        messages = process_single_row(
+            row,
+            hf_tokenizer,
+            add_answer=False,
+            start_answer_txt=start_answer_txt,
+        )
+        prompt_ids.append(_tokenize_prompt(messages, hf_tokenizer))
+
+    # Left-pad so all real tokens end at position max_len (decoder-only requirement).
+    original_padding_side = hf_tokenizer.padding_side
+    hf_tokenizer.padding_side = "left"
+    try:
+        encoded = hf_tokenizer.pad(
+            [{"input_ids": ids.tolist()} for ids in prompt_ids],
+            return_tensors="pt",
+            padding=True,
+        )
+    finally:
+        hf_tokenizer.padding_side = original_padding_side
+
+    dev = _model_device(model)
+    input_ids = encoded["input_ids"].to(dev)        # (B, max_prompt_len)
+    attention_mask = encoded["attention_mask"].to(dev)
+    prompt_len = input_ids.shape[1]
+
+    filtered = _filter_generate_kwargs(model, gen_kwargs)
+    output_ids = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        **filtered,
+    )  # (B, prompt_len + new_tokens)
+
+    results: list[str] = []
+    for i in range(len(rows)):
+        decoded = hf_tokenizer.decode(
+            output_ids[i][prompt_len:],
+            skip_special_tokens=True,
+        )
+        results.append(strip_qwen_thinking_tokens(decoded))
+    return results
+
+
+def _prepare_df(df: pd.DataFrame, sample_size: int | None) -> pd.DataFrame:
+    if sample_size is not None and sample_size > 0:
+        if "subset" not in df.columns:
+            return df.iloc[: min(sample_size, len(df))].copy()
+        lang_col = df["subset"].str.split("_", n=1).str[0]
+        langs = list(lang_col.unique())
+        n_langs = len(langs)
+        per_lang, remainder = divmod(sample_size, n_langs)
+        parts: list[pd.DataFrame] = []
+        for i, lang in enumerate(langs):
+            lang_df = df[lang_col == lang]
+            n = min(per_lang + (1 if i < remainder else 0), len(lang_df))
+            parts.append(lang_df.sample(n=n, random_state=42))
+        return pd.concat(parts).reset_index(drop=True)
+    return df
+
+
+def _print_eval_summary(rows: list[dict[str, Any]]) -> None:
+    if not rows or "rouge1_f1" not in rows[0]:
+        return
+    pdf = pd.DataFrame(rows)
+    metric_cols = [c for c in ("rouge1_f1", "rougeL_f1", "score") if c in pdf.columns]
+
+    print("\n" + "=" * 60)
+    print("EVAL SUMMARY (ROUGE means)")
+    print("=" * 60)
+    for col in metric_cols:
+        print(f"  {col}: {pdf[col].mean():.4f}")
+
+    if "expected_lang" in pdf.columns:
+        print("\nPER-LANGUAGE BREAKDOWN")
+        print("-" * 60)
+        for lang, grp in pdf.groupby("expected_lang"):
+            print(f"  [{lang}]  (n={len(grp)})")
+            for col in metric_cols:
+                print(f"    {col}: {grp[col].mean():.4f}")
+
+    print("=" * 60 + "\n")
+
+
+def run_eval(args: argparse.Namespace) -> None:
+    if args.gdrive_dataset_id:
+        out_path = args.data_csv_path or os.path.join(CUR_DIR, "data", "eval_download.csv")
+        dataset_path = download_gdown_file(args.gdrive_dataset_id, out_path)
+    else:
+        if not args.data_csv_path:
+            raise ValueError("Provide --data_csv_path or --gdrive_dataset_id.")
+        dataset_path = args.data_csv_path
+
+    df = pd.read_csv(dataset_path)
+    df = _prepare_df(df, args.sample_size)
+
+    if args.mode == "eval" and "output" not in df.columns:
+        raise ValueError("eval mode requires an 'output' column in the CSV.")
+
+    gen_path = args.gen_kwargs_path or DEFAULT_GEN_KWARGS_PATH
+    gen_from_file = _load_gen_kwargs(gen_path)
+    cli_max = {"max_new_tokens": args.max_new_tokens}
+    gen_kwargs = {**gen_from_file, **cli_max}
+    # CLI max_new_tokens wins if also in file
+    gen_kwargs["max_new_tokens"] = args.max_new_tokens
+
+    model, _tokenizer, hf_tokenizer = load_unsloth_model(args.model_id, dtype=args.dtype)
+    if args.adapter_path:
+        try:
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(model, args.adapter_path)
+        except ImportError as exc:
+            raise RuntimeError(
+                "peft is required when --adapter_path is set. Install peft or omit adapter_path."
+            ) from exc
+
+    FastLanguageModel.for_inference(model)
+    model.eval()
+
+    filtered_once = _filter_generate_kwargs(model, gen_kwargs)
+    if set(gen_kwargs) - set(filtered_once):
+        dropped = set(gen_kwargs) - set(filtered_once)
+        print(f"[eval] Ignored unknown generate kwargs (not supported by model): {sorted(dropped)}")
+
+    rows: list[dict[str, Any]] = []
+    labels = ["TargetRLF1", "TargetR1F1", "TargetLLM"]
+    batch_size = args.batch_size
+    n_batches = (len(df) + batch_size - 1) // batch_size
+
+    for batch_idx in tqdm.tqdm(range(n_batches), desc=args.mode):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, len(df))
+        batch_rows = [df.iloc[i] for i in range(start, end)]
+        global_indices = list(range(start, end))
+
+        try:
+            gen_answers = generate_batch(
+                batch_rows,
+                model,
+                hf_tokenizer,
+                args.start_answer_txt,
+                filtered_once,
+            )
+        except Exception as exc:
+            tqdm.tqdm.write(f"[WARNING] batch {batch_idx} (rows {start}-{end-1}) failed: {exc}")
+            gen_answers = [""] * len(batch_rows)
+
+        for row, idx, gen_answer in zip(batch_rows, global_indices, gen_answers):
+            if not gen_answer.strip():
+                gen_answer = (
+                    "I am unable to provide an answer to this question at this time."
+                )
+
+            if args.mode == "eval":
+                gold = row["output"]
+                rouge = calculate_rouge_score(str(gold), gen_answer)
+                lang, country = "", ""
+                try:
+                    parts = str(row["subset"]).split("_", 1)
+                    lang = parts[0] if parts else ""
+                    country = parts[1] if len(parts) > 1 else ""
+                except Exception:
+                    pass
+                rec: dict[str, Any] = {
+                    "ID": row.get("ID", idx),
+                    "input": row.get("input", ""),
+                    "gold_answer": gold,
+                    "gen_answer": gen_answer,
+                    "expected_lang": lang,
+                    "expected_country": country,
+                }
+                rec.update(rouge)
+                rows.append(rec)
+            else:
+                rec = {
+                    "ID": row.get("ID", idx),
+                    "expected_lang": "",
+                    "expected_country": "",
+                }
+                try:
+                    parts = str(row["subset"]).split("_", 1)
+                    rec["expected_lang"] = parts[0] if parts else ""
+                    rec["expected_country"] = parts[1] if len(parts) > 1 else ""
+                except Exception:
+                    pass
+                for lbl in labels:
+                    rec[lbl] = gen_answer
+                rows.append(rec)
+
+        if args.to_save_path and rows:
+            save_df = pd.DataFrame(rows)
+            if args.mode == "test":
+                save_df = save_df[["ID"] + labels]
+            os.makedirs(
+                os.path.dirname(os.path.abspath(args.to_save_path)) or ".",
+                exist_ok=True,
+            )
+            save_df.to_csv(args.to_save_path, index=False)
+
+    if args.mode == "eval":
+        _print_eval_summary(rows)
+
+    if args.to_save_path:
+        print(f"Results saved to: {args.to_save_path}")
+    elif not rows:
+        print("No rows processed.")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Run Unsloth inference on eval/test CSV (same prompts as training)."
+    )
+    p.add_argument(
+        "--data_csv_path",
+        type=str,
+        default=None,
+        help="CSV with columns: subset, input, ID; and output for --mode eval.",
+    )
+    p.add_argument(
+        "--gdrive_dataset_id",
+        type=str,
+        default=None,
+        help="Optional Google Drive file id; file is saved to --data_csv_path or data/eval_download.csv.",
+    )
+    p.add_argument("--model_id", type=str, required=True, help="Base model HF id or local path.")
+    p.add_argument(
+        "--adapter_path",
+        type=str,
+        default=None,
+        help="Optional PEFT adapter directory to load on top of base model.",
+    )
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="float16",
+        help="Torch dtype name for weights (e.g. float16 for T4, bfloat16 if supported).",
+    )
+    p.add_argument(
+        "--mode",
+        choices=("eval", "test"),
+        default="eval",
+        help="eval: ROUGE vs output; test: submission columns TargetRLF1, TargetR1F1, TargetLLM.",
+    )
+    p.add_argument(
+        "--sample_size",
+        type=int,
+        default=None,
+        help="If set, sample exactly N rows stratified by language (floor(N/num_langs) per language, remainder distributed round-robin).",
+    )
+    p.add_argument(
+        "--gen_kwargs_path",
+        type=str,
+        default=None,
+        help=f"JSON with model.generate kwargs. Default: {DEFAULT_GEN_KWARGS_PATH}",
+    )
+    p.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=256,
+        help="Max new tokens (also forwarded to generate; overrides JSON if both set).",
+    )
+    p.add_argument(
+        "--start_answer_txt",
+        type=str,
+        default="##Answer:",
+        help="Assistant prefix marker (must match training).",
+    )
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Number of rows per generate call. Higher = better GPU utilisation; lower if OOM.",
+    )
+    p.add_argument(
+        "--to_save_path",
+        type=str,
+        default=None,
+        help="Write incremental CSV results here (recommended).",
+    )
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    run_eval(parse_args())

@@ -1,0 +1,30 @@
+{
+  "per_device_train_batch_size": 8,
+  "gradient_accumulation_steps": 8,
+  "warmup_steps": 200,
+  "max_steps": 2000,
+  "learning_rate": 0.0002,
+  "logging_steps": 1,
+  "optim": "adamw_8bit",
+  "weight_decay": 0.001,
+  "lr_scheduler_type": "linear",
+  "save_strategy": "steps",
+  "save_steps": 200,
+  "save_total_limit": 3,
+  "push_to_hub": true,
+  "hub_model_id": "YOUR_USERNAME/qallm-qwen-sft",
+  "hub_strategy": "checkpoint",
+  "seed": 3407,
+  "output_dir": "outputs",
+  "report_to": "wandb",
+  "fp16": false,
+  "remove_unused_columns": false,
+  "dataset_text_field": "",
+  "dataset_kwargs": {
+    "skip_prepare_dataset": true
+  },
+  "max_length": 2048,
+  "gradient_checkpointing_kwargs": {
+    "use_reentrant": true
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "finetune_language_layers": true,
+  "finetune_attention_modules": true,
+  "finetune_mlp_modules": true,
+  "r": 64,
+  "lora_alpha": 64,
+  "lora_dropout": 0,
+  "bias": "none",
+  "random_state": 3407,
+  "use_gradient_checkpointing": true,
+  "use_rslora": false,
+  "loftq_config": null
+}
