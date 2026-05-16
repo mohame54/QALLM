@@ -97,42 +97,44 @@ class Mytrainer(SFTTrainer):
         outputs = model(**inputs)
         loss = outputs.loss / self.args.gradient_accumulation_steps
 
-        # Token-prediction accuracy over the answer spans (non-masked positions)
-        if labels is not None and outputs.logits is not None:
-            logits = outputs.logits          # (B, T, V)
-            # Causal-LM shift: logit at t predicts label at t+1
-            shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
-            shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
+        # Token-prediction accuracy over the answer spans (non-masked positions).
+        # Wrapped in try/except because unsloth may return EmptyLogits when
+        # UNSLOTH_RETURN_LOGITS is not honoured; in that case we skip accuracy
+        # silently rather than crashing the training run.
+        try:
+            if labels is not None and outputs.logits is not None:
+                logits = outputs.logits          # (B, T, V)
+                # Causal-LM shift: logit at t predicts label at t+1
+                shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
+                shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
 
-            mask = shift_labels != -100
-            total_tokens = mask.sum().item()
+                mask = shift_labels != -100
+                total_tokens = mask.sum().item()
 
-            if total_tokens > 0:
-                preds = shift_logits.argmax(dim=-1)
-                correct = (preds == shift_labels) & mask
+                if total_tokens > 0:
+                    preds = shift_logits.argmax(dim=-1)
+                    correct = (preds == shift_labels) & mask
 
-                # Accumulate raw counts so every token has equal weight across
-                # all micro-batches in a gradient-accumulation window.
-                self._overall_metrics["correct"] += correct.sum().item()
-                self._overall_metrics["total"] += total_tokens
+                    # Accumulate raw counts so every token has equal weight across
+                    # all micro-batches in a gradient-accumulation window.
+                    self._overall_metrics["correct"] += correct.sum().item()
+                    self._overall_metrics["total"] += total_tokens
 
-                # Accumulate per-language raw counts
-                if subsets is not None:
-                    for i, subset in enumerate(subsets):
-                        lang = subset.split("_")[0] if subset else "unknown"
-                        n_tokens = mask[i].sum().item()
-                        n_correct = correct[i].sum().item()
-                        if n_tokens > 0:
-                            self._lang_metrics[lang]["correct"] += n_correct
-                            self._lang_metrics[lang]["total"] += n_tokens
+                    # Accumulate per-language raw counts
+                    if subsets is not None:
+                        for i, subset in enumerate(subsets):
+                            lang = subset.split("_")[0] if subset else "unknown"
+                            n_tokens = mask[i].sum().item()
+                            n_correct = correct[i].sum().item()
+                            if n_tokens > 0:
+                                self._lang_metrics[lang]["correct"] += n_correct
+                                self._lang_metrics[lang]["total"] += n_tokens
+        except (NotImplementedError, AttributeError):
+            pass  # logits unavailable (unsloth EmptyLogits); skip accuracy
 
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: dict, **kwargs):
-        # Flush accumulated raw counts → ratios into TRL's _metrics dict.
-        # Doing this here (not inside compute_loss) ensures all micro-batches
-        # in a gradient-accumulation window are combined before the ratio is
-        # computed, so every token carries equal weight.
         if self._overall_metrics["total"] > 0:
             self._metrics["token_accuracy"].append(
                 self._overall_metrics["correct"] / self._overall_metrics["total"]

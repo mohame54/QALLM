@@ -1,5 +1,16 @@
-import argparse
 import os
+
+# Must be set before unsloth is imported; unsloth's for_training() resets this
+# flag to "0" internally, so we also patch os.environ to prevent that.
+os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+_orig_env_setitem = os.environ.__class__.__setitem__
+def _guarded_env_setitem(self, key, value):
+    if key == "UNSLOTH_RETURN_LOGITS" and value != "1":
+        return
+    _orig_env_setitem(self, key, value)
+os.environ.__class__.__setitem__ = _guarded_env_setitem
+
+import argparse
 from utils.datasets import QADataset
 from utils.model import get_peft_model
 from utils.common import download_gdown_file, load_json
