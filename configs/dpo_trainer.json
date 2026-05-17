@@ -1,0 +1,30 @@
+{
+  "per_device_train_batch_size": 4,
+  "gradient_accumulation_steps": 8,
+  "warmup_steps": 100,
+  "max_steps": 1000,
+  "learning_rate": 1e-6,
+  "logging_steps": 10,
+  "optim": "adamw_8bit",
+  "weight_decay": 0.001,
+  "lr_scheduler_type": "linear",
+  "save_strategy": "steps",
+  "save_steps": 200,
+  "save_total_limit": 3,
+  "push_to_hub": true,
+  "hub_model_id": "Muhammed164/SDPO",
+  "hub_strategy": "checkpoint",
+  "seed": 3407,
+  "output_dir": "dpo_outputs",
+  "report_to": "wandb",
+  "bf16": true,
+  "remove_unused_columns": false,
+  "max_length": 2048,
+  "beta": 0.1,
+  "loss_type": "sigmoid",
+  "precompute_ref_log_probs": true,
+  "gradient_checkpointing": true,
+  "gradient_checkpointing_kwargs": {
+    "use_reentrant": true
+  }
+}

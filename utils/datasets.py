@@ -177,7 +177,28 @@ class QADataset:
         return Dataset.from_pandas(df)
 
 
-def process_single_row(row, tokenizer, add_answer=False, start_answer_txt="##Answer:"):
+class QADPODataset(QADataset):
+    def to_hf_dataset(self):
+        df = self.df.copy(deep=True)
+        old_columns = df.columns.tolist()
+        df["messages"] = df.apply(
+            lambda row: process_single_row(
+                row,
+                self.transformers_tokenizer,
+                self.add_answer,
+                self.start_answer_txt,
+            ), axis=1)
+
+def 
+
+def process_single_row(
+    row,
+    tokenizer,
+    add_answer=False,
+    start_answer_txt="##Answer:",
+    q_column_name="input",
+    a_column_name="output",
+):
     try:
         lang, ctry = row["subset"].split("_")
     except Exception:
@@ -188,15 +209,15 @@ def process_single_row(row, tokenizer, add_answer=False, start_answer_txt="##Ans
     if add_answer:
         messages = create_message_instance(
             tokenizer,
-            row["input"],
-            row["output"],
+            row[q_column_name],
+            row[a_column_name],
             answer_start=start_answer_txt,
             language=lang,
             country=ctry,
         )
     else:
         messages = create_question(
-            row["input"],
+            row[q_column_name],
             tokenizer,
             answer_start=start_answer_txt,
             language=lang,
