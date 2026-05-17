@@ -1,9 +1,8 @@
-from __future__ import annotations
-
 import argparse
 import inspect
 import json
 import os
+import traceback
 from typing import Any
 
 import pandas as pd
@@ -65,10 +64,13 @@ def _model_device(model: Any) -> torch.device:
 
 
 def _ensure_pad_token(hf_tokenizer: Any) -> None:
-    """Set pad_token to eos_token when the tokenizer has none (common for Qwen/LLaMA)."""
+    """Set pad_token to eos_token when the tokenizer has none (common for Qwen/LLaMA).
+    Also enforce left-padding, which is required for decoder-only generation.
+    """
     if hf_tokenizer.pad_token_id is None:
         hf_tokenizer.pad_token = hf_tokenizer.eos_token
         hf_tokenizer.pad_token_id = hf_tokenizer.eos_token_id
+    hf_tokenizer.padding_side = "left"
 
 
 
@@ -82,40 +84,47 @@ def generate_batch(
 ) -> list[str]:
     _ensure_pad_token(hf_tokenizer)
 
-    prompt_ids: list[torch.Tensor] = []
-    for row in rows:
-        messages = process_single_row(
-            row,
-            hf_tokenizer,
-            add_answer=False,
-            start_answer_txt=start_answer_txt,
-        )
-        input_text = hf_tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        input_text= input_text[:input_text.index(start_answer_txt) + len(start_answer_txt)]
-        inputs = hf_tokenizer(
-                text=input_text,
-                images=None,
-                add_special_tokens = False,
-                return_tensors = "pt",
-            )
-        prompt_ids.append(inputs["input_ids"].squeeze(0))
-
-    # Left-pad so all real tokens end at position max_len (decoder-only requirement).
-    original_padding_side = hf_tokenizer.padding_side
-    hf_tokenizer.padding_side = "left"
+    prompt_ids = []
+    max_len = 0
     try:
-        encoded = hf_tokenizer.pad(
-            [{"input_ids": ids.tolist()} for ids in prompt_ids],
-            return_tensors="pt",
-            padding=True,
-        )
-    finally:
-        hf_tokenizer.padding_side = original_padding_side
+        for row in rows:
+            messages = process_single_row(
+                row,
+                hf_tokenizer,
+                add_answer=False,
+                start_answer_txt=start_answer_txt,
+            )
+            input_text = hf_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            input_text= input_text[:input_text.index(start_answer_txt) + len(start_answer_txt)]
+            inputs = hf_tokenizer.encode(
+                    text=input_text,
+                    add_special_tokens = False,
+                )
+            max_len = max(max_len, len(inputs))
+            prompt_ids.append(inputs)
+    except Exception as e:
+        print(f"Error processing row: {e} within {input_text}")
+        traceback.print_exc()
+        raise
 
+    if not prompt_ids:
+        return []
+    # Left-pad so all real tokens end at position max_len (decoder-only requirement).
+    padded_input: list[list[int]] = []
+    attention_mask: list[list[int]] = []
+    pad_id = hf_tokenizer.pad_token_id
+    for ids in prompt_ids:
+        pad_amt = max_len - len(ids)
+        padded_input.append([pad_id] * pad_amt + ids)
+        attention_mask.append([0] * pad_amt + [1] * len(ids))
+
+    batch: dict = {
+        "input_ids": torch.tensor(padded_input, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+    }
     dev = _model_device(model)
-    input_ids = encoded["input_ids"].to(dev)        # (B, max_prompt_len)
-    attention_mask = encoded["attention_mask"].to(dev)
-    prompt_len = input_ids.shape[1]
+    input_ids = batch["input_ids"].to(dev)        # (B, max_prompt_len)
+    attention_mask = batch["attention_mask"].to(dev)
 
     filtered = _filter_generate_kwargs(model, gen_kwargs)
     output_ids = model.generate(
@@ -127,7 +136,7 @@ def generate_batch(
     results: list[str] = []
     for i in range(len(rows)):
         decoded = hf_tokenizer.decode(
-            output_ids[i][prompt_len:],
+            output_ids[i][max_len:],
             skip_special_tokens=True,
         )
         results.append(strip_qwen_thinking_tokens(decoded))
@@ -227,6 +236,7 @@ def run_eval(args: argparse.Namespace) -> None:
         except Exception as exc:
             tqdm.tqdm.write(f"[WARNING] batch {batch_idx} (rows {start}-{end-1}) failed: {exc}")
             gen_answers = [""] * len(batch_rows)
+            print(traceback.format_exc())
 
         for row, idx, gen_answer in zip(batch_rows, global_indices, gen_answers):
             if not gen_answer.strip():

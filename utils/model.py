@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer
 from unsloth import FastLanguageModel # FastLanguageModel for LLMs
+from peft import PeftModel
 import torch
 
 
@@ -54,18 +55,11 @@ def get_peft_model(
 
         model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
     else:
-        try:
-            _parts = adapter_path.split("/")
-            if len(_parts) > 2:
-                _adapter_repo = "/".join(_parts[:2])
-                _adapter_subfolder = "/".join(_parts[2:])
-                model = FastLanguageModel.get_peft_model(
-                    model, _adapter_repo, subfolder=_adapter_subfolder
-                )
-            else:
-                model = FastLanguageModel.get_peft_model(model, adapter_path)
-        except ImportError as exc:
-            raise RuntimeError(
-                "peft is required when --adapter_path is set. Install peft or omit adapter_path."
-            ) from exc
+        _parts = adapter_path.split("/")
+        if len(_parts) > 2:
+            _adapter_repo = "/".join(_parts[:2])
+            _adapter_subfolder = "/".join(_parts[2:])
+            model = PeftModel.from_pretrained(model, _adapter_repo, subfolder=_adapter_subfolder)
+        else:
+            model = PeftModel.from_pretrained(model, adapter_path)
     return model, tokenizer, hf_tokenizer

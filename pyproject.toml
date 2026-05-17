@@ -9,5 +9,6 @@ dependencies = [
     "gdown>=6.0.0",
     "matplotlib>=3.10.9",
     "pandas>=3.0.3",
+    "rouge-score>=0.1.2",
     "wandb>=0.27.0",
 ]
