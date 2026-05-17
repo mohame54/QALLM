@@ -115,7 +115,6 @@ def create_tokens_labels(
 ):
     chat_template_kwargs = {k: v for k, v in chat_template_kwargs.items() if v is not None}
     chat_template_kwargs['return_tensors'] = None
-    # tokenize must be True to get token ids
     chat_template_kwargs['tokenize'] = True
 
     # 1. Full conversation tokens

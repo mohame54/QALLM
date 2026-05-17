@@ -15,7 +15,7 @@ from utils.common import download_gdown_file
 from utils.datasets import process_single_row
 from utils.instructions import strip_qwen_thinking_tokens
 from utils.metrics import calculate_rouge_score
-from utils.model import load_unsloth_model
+from utils.model import get_peft_model
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN_KWARGS_PATH = os.path.join(CUR_DIR, "configs", "gen.json")
@@ -71,52 +71,6 @@ def _ensure_pad_token(hf_tokenizer: Any) -> None:
         hf_tokenizer.pad_token_id = hf_tokenizer.eos_token_id
 
 
-def _tokenize_prompt(messages: list, hf_tokenizer: Any) -> torch.Tensor:
-    """Apply chat template and return a 1-D input_ids tensor.
-
-    When messages end with an assistant turn (the ##Answer: prefix), we must
-    use continue_final_message=True so the template leaves that turn open for
-    the model to continue, rather than closing it and opening a second one.
-    """
-    last_role = messages[-1]["role"] if messages and isinstance(messages[-1], dict) else None
-    has_assistant_prefix = last_role == "assistant"
-
-    try:
-        if has_assistant_prefix:
-            ids = hf_tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=False,
-                continue_final_message=True,
-                tokenize=True,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-        else:
-            ids = hf_tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-    except TypeError:
-        if has_assistant_prefix:
-            ids = hf_tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=False,
-                continue_final_message=True,
-                return_tensors="pt",
-            )
-        else:
-            ids = hf_tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-    if isinstance(ids, dict):
-        ids = ids["input_ids"]
-    return ids.squeeze(0)  # (seq_len,)
-
 
 @torch.inference_mode()
 def generate_batch(
@@ -126,8 +80,6 @@ def generate_batch(
     start_answer_txt: str,
     gen_kwargs: dict[str, Any],
 ) -> list[str]:
-    """Tokenize a batch of CSV rows with left-padding, run a single `generate` call,
-    return decoded new tokens (prompt stripped) for each row."""
     _ensure_pad_token(hf_tokenizer)
 
     prompt_ids: list[torch.Tensor] = []
@@ -138,7 +90,15 @@ def generate_batch(
             add_answer=False,
             start_answer_txt=start_answer_txt,
         )
-        prompt_ids.append(_tokenize_prompt(messages, hf_tokenizer))
+        input_text = hf_tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        input_text= input_text[:input_text.index(start_answer_txt) + len(start_answer_txt)]
+        inputs = hf_tokenizer(
+                text=input_text,
+                images=None,
+                add_special_tokens = False,
+                return_tensors = "pt",
+            )
+        prompt_ids.append(inputs["input_ids"].squeeze(0))
 
     # Left-pad so all real tokens end at position max_len (decoder-only requirement).
     original_padding_side = hf_tokenizer.padding_side
@@ -234,27 +194,9 @@ def run_eval(args: argparse.Namespace) -> None:
     # CLI max_new_tokens always wins over the JSON file value.
     gen_kwargs = {**gen_from_file, "max_new_tokens": args.max_new_tokens}
 
-    model, _tokenizer, hf_tokenizer = load_unsloth_model(args.model_id, dtype=args.dtype)
-    if args.adapter_path:
-        try:
-            from peft import PeftModel
-
-            # Support HF Hub subfolder paths like "org/repo/subfolder".
-            # PeftModel.from_pretrained expects (repo_id, subfolder=...) separately.
-            _parts = args.adapter_path.split("/")
-            if len(_parts) > 2:
-                _adapter_repo = "/".join(_parts[:2])
-                _adapter_subfolder = "/".join(_parts[2:])
-                model = PeftModel.from_pretrained(
-                    model, _adapter_repo, subfolder=_adapter_subfolder
-                )
-            else:
-                model = PeftModel.from_pretrained(model, args.adapter_path)
-        except ImportError as exc:
-            raise RuntimeError(
-                "peft is required when --adapter_path is set. Install peft or omit adapter_path."
-            ) from exc
-
+    model, tokenizer, hf_tokenizer = get_peft_model(
+        args.model_id, dtype=args.dtype, adapter_path=args.adapter_path
+    )
     FastLanguageModel.for_inference(model)
     model.eval()
 

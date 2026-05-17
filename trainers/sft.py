@@ -38,7 +38,6 @@ class Qwen3_5Collator:
                 messages,
                 answer_start_txt=self.answer_start_text,
                 tokenize=True,
-                enable_thinking=False,
             )
             batch_input_ids.append(full_ids)
             batch_labels.append(labels)
@@ -90,43 +89,49 @@ class Mytrainer(SFTTrainer):
 
         labels = inputs.get("labels")
         outputs = model(**inputs)
-        loss = outputs.loss / self.args.gradient_accumulation_steps
+
+        # Scale loss only during training; eval loss is already a batch mean.
+        if model.training:
+            loss = outputs.loss / self.args.gradient_accumulation_steps
+        else:
+            loss = outputs.loss
 
         # Token-prediction accuracy over the answer spans (non-masked positions).
+        # Only accumulated during training; evaluate() runs its own eval loop.
         # Wrapped in try/except because unsloth may return EmptyLogits when
         # UNSLOTH_RETURN_LOGITS is not honoured; in that case we skip accuracy
         # silently rather than crashing the training run.
-        try:
-            if labels is not None and outputs.logits is not None:
-                logits = outputs.logits          # (B, T, V)
-                # Causal-LM shift: logit at t predicts label at t+1
-                shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
-                shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
+        if model.training:
+            try:
+                if labels is not None and outputs.logits is not None:
+                    logits = outputs.logits          # (B, T, V)
+                    # Causal-LM shift: logit at t predicts label at t+1
+                    shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
+                    shift_labels = labels[..., 1:].contiguous()        # (B, T-1)
 
-                mask = shift_labels != -100
-                total_tokens = mask.sum().item()
+                    mask = shift_labels != -100
+                    total_tokens = mask.sum().item()
 
-                if total_tokens > 0:
-                    preds = shift_logits.argmax(dim=-1)
-                    correct = (preds == shift_labels) & mask
+                    if total_tokens > 0:
+                        preds = shift_logits.argmax(dim=-1)
+                        correct = (preds == shift_labels) & mask
 
-                    # Accumulate raw counts so every token has equal weight across
-                    # all micro-batches in a gradient-accumulation window.
-                    self._overall_metrics["correct"] += correct.sum().item()
-                    self._overall_metrics["total"] += total_tokens
+                        # Accumulate raw counts so every token has equal weight across
+                        # all micro-batches in a gradient-accumulation window.
+                        self._overall_metrics["correct"] += correct.sum().item()
+                        self._overall_metrics["total"] += total_tokens
 
-                    # Accumulate per-language raw counts
-                    if subsets is not None:
-                        for i, subset in enumerate(subsets):
-                            lang = subset.split("_")[0] if subset else "unknown"
-                            n_tokens = mask[i].sum().item()
-                            n_correct = correct[i].sum().item()
-                            if n_tokens > 0:
-                                self._lang_metrics[lang]["correct"] += n_correct
-                                self._lang_metrics[lang]["total"] += n_tokens
-        except (NotImplementedError, AttributeError):
-            print("Logits unavailable (unsloth EmptyLogits); skipping accuracy")
-            pass  # logits unavailable (unsloth EmptyLogits); skip accuracy
+                        # Accumulate per-language raw counts
+                        if subsets is not None:
+                            for i, subset in enumerate(subsets):
+                                lang = subset.split("_")[0] if subset else "unknown"
+                                n_tokens = mask[i].sum().item()
+                                n_correct = correct[i].sum().item()
+                                if n_tokens > 0:
+                                    self._lang_metrics[lang]["correct"] += n_correct
+                                    self._lang_metrics[lang]["total"] += n_tokens
+            except (NotImplementedError, AttributeError):
+                print("Logits unavailable (unsloth EmptyLogits); skipping accuracy")
 
         return (loss, outputs) if return_outputs else loss
 
@@ -149,6 +154,93 @@ class Mytrainer(SFTTrainer):
             super().log(logs, start_time, **kwargs)
         else:
             super().log(logs, **kwargs)
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            return None
+        return DataLoader(
+            dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            collate_fn=self.data_collator,
+            shuffle=False,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    @torch.no_grad()
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            return {}
+
+        dataloader = self.get_eval_dataloader(dataset)
+        dev = next(self.model.parameters()).device
+
+        self.model.eval()
+
+        total_loss = 0.0
+        n_batches = 0
+        overall: dict[str, int] = {"correct": 0, "total": 0}
+        lang_acc: defaultdict = defaultdict(lambda: {"correct": 0, "total": 0})
+
+        for batch in dataloader:
+            subsets: list[str] | None = batch.pop("subset", None)
+            batch = {k: v.to(dev) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            outputs = self.model(**batch)
+            total_loss += outputs.loss.item()
+            n_batches += 1
+
+            labels = batch.get("labels")
+            if labels is not None and outputs.logits is not None:
+                try:
+                    shift_logits = outputs.logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    mask = shift_labels != -100
+                    if mask.sum().item() > 0:
+                        preds = shift_logits.argmax(dim=-1)
+                        correct = (preds == shift_labels) & mask
+                        overall["correct"] += correct.sum().item()
+                        overall["total"] += mask.sum().item()
+                        if subsets:
+                            for i, subset in enumerate(subsets):
+                                lang = subset.split("_")[0] if subset else "unknown"
+                                n_tok = mask[i].sum().item()
+                                n_cor = correct[i].sum().item()
+                                if n_tok > 0:
+                                    lang_acc[lang]["correct"] += n_cor
+                                    lang_acc[lang]["total"] += n_tok
+                except (NotImplementedError, AttributeError):
+                    pass
+
+        self.model.train()
+
+        logs: dict[str, float] = {}
+        if n_batches > 0:
+            logs[f"{metric_key_prefix}_loss"] = round(total_loss / n_batches, 4)
+        if overall["total"] > 0:
+            logs[f"{metric_key_prefix}_token_accuracy"] = round(
+                overall["correct"] / overall["total"], 4
+            )
+        for lang, stats in lang_acc.items():
+            if stats["total"] > 0:
+                logs[f"{metric_key_prefix}_token_accuracy_{lang}"] = round(
+                    stats["correct"] / stats["total"], 4
+                )
+
+        # Print a readable summary
+        step = self.state.global_step
+        print(f"\n{'='*60}")
+        print(f"VALIDATION @ step {step}")
+        print(f"{'='*60}")
+        for k, v in logs.items():
+            print(f"  {k}: {v:.4f}")
+        print(f"{'='*60}\n")
+
+        # Bypass Mytrainer.log (which flushes train metrics) and go straight
+        # to the parent Trainer.log so wandb / logging integration still works.
+        super(Mytrainer, self).log(logs)
+        return logs
 
     def get_train_dataloader(self):
        
