@@ -181,15 +181,26 @@ class QADPODataset(QADataset):
     def to_hf_dataset(self):
         df = self.df.copy(deep=True)
         old_columns = df.columns.tolist()
-        df["messages"] = df.apply(
-            lambda row: process_single_row(
-                row,
-                self.transformers_tokenizer,
-                self.add_answer,
-                self.start_answer_txt,
-            ), axis=1)
 
-def 
+        df["prompt"] = df.apply(
+            lambda row: create_question(
+                row["input"],
+                self.transformers_tokenizer,
+                None,
+                language=row["expected_lang"],
+                country=row["expected_country"],
+                apply_chat_template=False,
+            ), axis=1)
+        df['chosen'] = df['gold_answer'].apply(
+            lambda x: [{"role": "assistant", "content": self.start_answer_txt + " " + x}]
+        )
+        df['rejected'] = df['gen_answer'].apply(
+            lambda x: [{"role": "assistant", "content": self.start_answer_txt + " " + x}]
+        )
+        df.drop(columns=old_columns, inplace=True)
+        return Dataset.from_pandas(df)
+
+
 
 def process_single_row(
     row,
