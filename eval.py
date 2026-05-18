@@ -14,7 +14,7 @@ from utils.common import download_gdown_file
 from utils.datasets import process_single_row
 from utils.instructions import strip_qwen_thinking_tokens
 from utils.metrics import calculate_rouge_score
-from utils.model import get_peft_model
+from utils.model import get_peft_model, load_unsloth_model
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN_KWARGS_PATH = os.path.join(CUR_DIR, "configs", "gen.json")
@@ -203,9 +203,13 @@ def run_eval(args: argparse.Namespace) -> None:
     # CLI max_new_tokens always wins over the JSON file value.
     gen_kwargs = {**gen_from_file, "max_new_tokens": args.max_new_tokens}
 
-    model, tokenizer, hf_tokenizer = get_peft_model(
-        args.model_id, dtype=args.dtype, adapter_path=args.adapter_path
-    )
+    if args.adapter_path:
+        model, _, hf_tokenizer = get_peft_model(
+            args.model_id, dtype=args.dtype, adapter_path=args.adapter_path, add_peft_kwargs=False
+        )
+    else:
+        # Base model — no LoRA adapter; load directly without any PEFT wrapping.
+        model, _, hf_tokenizer = load_unsloth_model(args.model_id, dtype=args.dtype)
     FastLanguageModel.for_inference(model)
     model.eval()
 

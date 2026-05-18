@@ -158,7 +158,9 @@ class QADataset:
 
     @classmethod
     def from_csv(cls, path: str, transformers_tokenizer):
-        df = pd.read_csv(path).dropna(subset=["subset"]).reset_index(drop=True)
+        df = pd.read_csv(path)
+        if 'subset' in df.columns:
+            df = df.dropna(subset=["subset"]).reset_index(drop=True)
         return cls(df, transformers_tokenizer)
 
     def to_hf_dataset(self):

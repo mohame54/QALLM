@@ -33,27 +33,29 @@ def get_peft_model(
     loftq_config=None,
     target_modules=None,
     dtype="bfloat16",
-    adapter_path=None
+    adapter_path=None,
+    add_peft_kwargs=True,
 ):
     model, tokenizer, hf_tokenizer = load_unsloth_model(model_id, dtype=dtype)
     if adapter_path is None:
-        peft_kwargs = {
-            "finetune_language_layers": finetune_language_layers,
-            "finetune_attention_modules": finetune_attention_modules,
-            "finetune_mlp_modules": finetune_mlp_modules,
-            "r": r if r is not None else lora_rank,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": lora_dropout,
-            "bias": bias,
-            "random_state": random_state,
-            "use_gradient_checkpointing": use_gradient_checkpointing,
-            "use_rslora": use_rslora,
-            "loftq_config": loftq_config,
-        }
-        if target_modules is not None:
-            peft_kwargs["target_modules"] = target_modules
+        if add_peft_kwargs:
+            peft_kwargs = {
+                "finetune_language_layers": finetune_language_layers,
+                "finetune_attention_modules": finetune_attention_modules,
+                "finetune_mlp_modules": finetune_mlp_modules,
+                "r": r if r is not None else lora_rank,
+                "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "bias": bias,
+                "random_state": random_state,
+                "use_gradient_checkpointing": use_gradient_checkpointing,
+                "use_rslora": use_rslora,
+                "loftq_config": loftq_config,
+            }
+            if target_modules is not None:
+                peft_kwargs["target_modules"] = target_modules
 
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+            model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
     else:
         _parts = adapter_path.split("/")
         if len(_parts) > 2:
