@@ -1,11 +1,74 @@
 import torch
 from collections import defaultdict
 from typing import Any
+import pandas as pd
 from trl import SFTTrainer
-from utils.instructions import create_tokens_labels
+from utils.instructions import (
+    AyaChatPromptTemplate,
+    create_tokens_labels,
+    STUDENT_TEMPLATE,
+    SYSTEM_PROMPT,
+)
 from trainers.configs import Qwen3_5SFTConfig
 from torch.utils.data import DataLoader
-from utils.datasets import LanguageStratifiedBatchSampler
+from utils.datasets import LanguageStratifiedBatchSampler, COUNTRY_MAP
+from utils.metrics import calculate_rouge_score
+
+
+class AyaCollator:
+    def __init__(
+        self,
+        tokenizer: Any,
+        max_seq_length: int,
+        chat_template_kwargs=None,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
+
+        self.chat_template = AyaChatPromptTemplate(tokenizer)
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        batch_input_ids: list[list[int]] = []
+        batch_labels: list[list[int]] = []
+        subsets: list[str] = []
+        max_len = 0
+        pad_id = self.tokenizer.pad_token_id
+        for feat in features:
+            messages = feat["messages"]
+            subsets.append(feat.get("subset", ""))
+            full_ids, _, labels = self.chat_template.create_token_labels(
+                messages,
+            )
+            batch_input_ids.append(full_ids)
+            batch_labels.append(labels)
+            max_len = min(max(max_len, len(full_ids)), self.max_seq_length)
+
+        padded_input: list[list[int]] = []
+        padded_labels: list[list[int]] = []
+        attention_mask: list[list[int]] = []
+        for ids, lab in zip(batch_input_ids, batch_labels, strict=True):
+            pad_amt = max_len - len(ids)
+            attn_mask = [1] * len(ids)
+            if self.chat_template.padding_side == "left":
+                ids = [pad_id] * pad_amt + ids
+                lab = [-100] * pad_amt + lab
+                attn_mask = [0] * pad_amt + attn_mask
+            else:
+                ids = ids + [pad_id] * pad_amt
+                lab = lab + [-100] * pad_amt
+                attn_mask = attn_mask + [0] * pad_amt
+            assert len(ids) == len(lab) == len(attn_mask)
+            padded_input.append(ids)
+            padded_labels.append(lab)
+            attention_mask.append(attn_mask)
+        batch: dict = {
+            "input_ids": torch.tensor(padded_input, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long),
+            "subset": subsets,
+        }
+        return batch
 
 
 class Qwen3_5Collator:
@@ -49,9 +112,19 @@ class Qwen3_5Collator:
 
         for ids, lab in zip(batch_input_ids, batch_labels, strict=True):
             pad_amt = max_len - len(ids)
-            padded_input.append(ids + [pad_id] * pad_amt)
-            padded_labels.append(lab + [-100] * pad_amt)
-            attention_mask.append([1] * len(ids) + [0] * pad_amt)
+            attn_mask = [1] * len(ids)
+            if self.tokenizer.padding_side == "left":
+                ids = [pad_id] * pad_amt + ids
+                lab = [-100] * pad_amt + lab
+                attn_mask = [0] * pad_amt + attn_mask
+            else:
+                ids = ids + [pad_id] * pad_amt
+                lab = lab + [-100] * pad_amt
+                attn_mask = attn_mask + [0] * pad_amt
+            assert len(ids) == len(lab) == len(attn_mask)
+            padded_input.append(ids)
+            padded_labels.append(lab)
+            attention_mask.append(attn_mask)
 
         batch: dict = {
             "input_ids": torch.tensor(padded_input, dtype=torch.long),
@@ -62,14 +135,16 @@ class Qwen3_5Collator:
         return batch
 
 
-
-
-
 class Mytrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
         # 1. Save your custom collator from kwargs before initializing the parent
         custom_collator = kwargs.get("data_collator")
         self.sampling_alpha = kwargs.pop("sampling_alpha", 0.5)
+        # Generation-eval settings: sample M examples from val_df every eval pass.
+        self.gen_eval_samples: int = kwargs.pop("gen_eval_samples", 0)
+        self.val_df: pd.DataFrame | None = kwargs.pop("val_df", None)
+        self.model_family: str = kwargs.pop("model_family", "qwen")
+        self.max_gen_length: int = kwargs.pop("max_gen_length", 256)
 
         super().__init__(*args, **kwargs)
 
@@ -95,12 +170,6 @@ class Mytrainer(SFTTrainer):
             loss = outputs.loss / self.args.gradient_accumulation_steps
         else:
             loss = outputs.loss
-
-        # Token-prediction accuracy over the answer spans (non-masked positions).
-        # Only accumulated during training; evaluate() runs its own eval loop.
-        # Wrapped in try/except because unsloth may return EmptyLogits when
-        # UNSLOTH_RETURN_LOGITS is not honoured; in that case we skip accuracy
-        # silently rather than crashing the training run.
         if model.training:
             try:
                 if labels is not None and outputs.logits is not None:
@@ -170,63 +239,16 @@ class Mytrainer(SFTTrainer):
 
     @torch.no_grad()
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        if dataset is None:
-            return {}
-
-        dataloader = self.get_eval_dataloader(dataset)
-        dev = next(self.model.parameters()).device
-
-        self.model.eval()
-
-        total_loss = 0.0
-        n_batches = 0
-        overall: dict[str, int] = {"correct": 0, "total": 0}
-        lang_acc: defaultdict = defaultdict(lambda: {"correct": 0, "total": 0})
-
-        for batch in dataloader:
-            subsets: list[str] | None = batch.pop("subset", None)
-            batch = {k: v.to(dev) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            outputs = self.model(**batch)
-            total_loss += outputs.loss.item()
-            n_batches += 1
-
-            labels = batch.get("labels")
-            if labels is not None and outputs.logits is not None:
-                try:
-                    shift_logits = outputs.logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    mask = shift_labels != -100
-                    if mask.sum().item() > 0:
-                        preds = shift_logits.argmax(dim=-1)
-                        correct = (preds == shift_labels) & mask
-                        overall["correct"] += correct.sum().item()
-                        overall["total"] += mask.sum().item()
-                        if subsets:
-                            for i, subset in enumerate(subsets):
-                                lang = subset.split("_")[0] if subset else "unknown"
-                                n_tok = mask[i].sum().item()
-                                n_cor = correct[i].sum().item()
-                                if n_tok > 0:
-                                    lang_acc[lang]["correct"] += n_cor
-                                    lang_acc[lang]["total"] += n_tok
-                except (NotImplementedError, AttributeError):
-                    pass
-
-        self.model.train()
-
         logs: dict[str, float] = {}
-        if n_batches > 0:
-            logs[f"{metric_key_prefix}_loss"] = round(total_loss / n_batches, 4)
-        if overall["total"] > 0:
-            logs[f"{metric_key_prefix}_token_accuracy"] = round(
-                overall["correct"] / overall["total"], 4
-            )
-        for lang, stats in lang_acc.items():
-            if stats["total"] > 0:
-                logs[f"{metric_key_prefix}_token_accuracy_{lang}"] = round(
-                    stats["correct"] / stats["total"], 4
+        # ── generation-based evaluation (exact-match, token-F1) ─────────────
+        if self.gen_eval_samples > 0 and self.val_df is not None:
+            try:
+                gen_logs = self._run_generation_eval(
+                    self.gen_eval_samples, metric_key_prefix
                 )
+                logs.update(gen_logs)
+            except Exception as exc:
+                print(f"[eval] Generation eval failed: {exc}")
 
         # Print a readable summary
         step = self.state.global_step
@@ -234,12 +256,148 @@ class Mytrainer(SFTTrainer):
         print(f"VALIDATION @ step {step}")
         print(f"{'='*60}")
         for k, v in logs.items():
-            print(f"  {k}: {v:.4f}")
+            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
         print(f"{'='*60}\n")
-
-        # Bypass Mytrainer.log (which flushes train metrics) and go straight
-        # to the parent Trainer.log so wandb / logging integration still works.
         super(Mytrainer, self).log(logs)
+        return logs
+
+    @torch.no_grad()
+    def _run_generation_eval(
+        self, n_samples: int, metric_key_prefix: str = "eval"
+    ) -> dict[str, float]:
+        hf_tokenizer = self.data_collator.tokenizer
+        dev = next(self.model.parameters()).device
+
+        sample_df = self.val_df.sample(
+            n=min(n_samples, len(self.val_df)),
+            random_state=self.state.global_step,
+        ).reset_index(drop=True)
+
+        aya_template = AyaChatPromptTemplate(hf_tokenizer) if self.model_family == "aya" else None
+
+        predictions: list[str] = []
+        references: list[str] = []
+        subsets_list: list[str] = []
+
+        for _, row in sample_df.iterrows():
+            subset = str(row.get("subset", ""))
+            ref_answer = str(row.get("output", "")).strip()
+
+            try:
+                lang, ctry = subset.split("_", 1)
+            except ValueError:
+                lang, ctry = subset, ""
+            if ctry in COUNTRY_MAP:
+                ctry = COUNTRY_MAP[ctry]
+
+            content = (
+                STUDENT_TEMPLATE.format(question=row["input"], language=lang, country=ctry)
+                if (lang or ctry)
+                else str(row["input"])
+            )
+
+            if self.model_family == "aya":
+                # Build user-only messages; apply_chat_prompt_template adds system +
+                # opens the assistant turn via generation=True.
+                messages = [{"role": "user", "content": content}]
+                prompt_text = aya_template.apply_chat_prompt_template(
+                    messages, generation=True
+                )
+                input_ids = hf_tokenizer.encode(
+                    prompt_text, add_special_tokens=False, return_tensors="pt"
+                ).to(dev)
+            else:
+                # Qwen: build prefix up to (and including) the ##Answer: marker so
+                # the model continues the answer rather than regenerating the marker.
+                prefix_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ]
+                prefix_ids = hf_tokenizer.apply_chat_template(
+                    prefix_messages,
+                    enable_thinking=False,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                )
+                answer_start_ids = hf_tokenizer.encode(
+                    "##Answer:", add_special_tokens=False
+                )
+                input_ids = torch.tensor(
+                    [prefix_ids + answer_start_ids], dtype=torch.long
+                ).to(dev)
+            out_ids = self.model.generate(
+                input_ids,
+                max_new_tokens=self.max_gen_length,
+                do_sample=False,
+                pad_token_id=hf_tokenizer.pad_token_id or hf_tokenizer.eos_token_id,
+                eos_token_id=hf_tokenizer.eos_token_id,
+            )
+
+            gen_ids = out_ids[0][input_ids.shape[-1]:]
+            pred = hf_tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+            predictions.append(pred)
+            references.append(ref_answer)
+            subsets_list.append(subset)
+
+        return self._compute_gen_metrics(
+            predictions, references, subsets_list, metric_key_prefix
+        )
+
+    def _compute_gen_metrics(
+        self,
+        predictions: list[str],
+        references: list[str],
+        subsets: list[str],
+        prefix: str,
+    ) -> dict[str, float]:
+        def normalize(s: str) -> str:
+            return s.strip().lower()
+
+        n = len(predictions)
+        exact_matches: list[bool] = []
+        rouge1_scores: list[float] = []
+        rougeL_scores: list[float] = []
+        combined_scores: list[float] = []
+
+        for pred, ref in zip(predictions, references):
+            exact_matches.append(normalize(pred) == normalize(ref))
+            rouge = calculate_rouge_score(ref, pred)
+            rouge1_scores.append(rouge["rouge1_f1"])
+            rougeL_scores.append(rouge["rougeL_f1"])
+            combined_scores.append(rouge["score"])
+
+        def mean(vals: list) -> float:
+            return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+        logs: dict[str, float] = {
+            f"{prefix}_gen_exact_match": mean(exact_matches),
+            f"{prefix}_gen_rouge1": mean(rouge1_scores),
+            f"{prefix}_gen_rougeL": mean(rougeL_scores),
+            f"{prefix}_gen_score": mean(combined_scores),
+            f"{prefix}_gen_n_samples": float(n),
+        }
+
+        lang_em: dict[str, list] = defaultdict(list)
+        lang_r1: dict[str, list] = defaultdict(list)
+        lang_rl: dict[str, list] = defaultdict(list)
+        lang_sc: dict[str, list] = defaultdict(list)
+
+        for em, r1, rl, sc, subset in zip(
+            exact_matches, rouge1_scores, rougeL_scores, combined_scores, subsets
+        ):
+            lang = subset.split("_")[0] if subset else "unknown"
+            lang_em[lang].append(em)
+            lang_r1[lang].append(r1)
+            lang_rl[lang].append(rl)
+            lang_sc[lang].append(sc)
+
+        for lang in lang_em:
+            logs[f"{prefix}_gen_exact_match_{lang}"] = mean(lang_em[lang])
+            logs[f"{prefix}_gen_rouge1_{lang}"] = mean(lang_r1[lang])
+            logs[f"{prefix}_gen_rougeL_{lang}"] = mean(lang_rl[lang])
+            logs[f"{prefix}_gen_score_{lang}"] = mean(lang_sc[lang])
+
         return logs
 
     def get_train_dataloader(self):

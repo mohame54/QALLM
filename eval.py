@@ -12,12 +12,26 @@ from unsloth import FastLanguageModel
 
 from utils.common import download_gdown_file
 from utils.datasets import process_single_row
-from utils.instructions import strip_qwen_thinking_tokens
+from utils.instructions import AyaChatPromptTemplate, strip_qwen_thinking_tokens
 from utils.metrics import calculate_rouge_score
 from utils.model import get_peft_model, load_unsloth_model
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN_KWARGS_PATH = os.path.join(CUR_DIR, "configs", "gen.json")
+
+
+def _detect_model_family(model_id: str) -> str:
+    """Return 'aya' for Cohere/Aya models, 'qwen' otherwise."""
+    mid = model_id.lower()
+    if "aya" in mid:
+        return "aya"
+    if "qwen" in mid:
+        return "qwen"
+    return "qwen"
+
+
+def _compute_exact_match(pred: str, ref: str) -> bool:
+    return pred.strip().lower() == ref.strip().lower()
 
 
 def _load_gen_kwargs(path: str | None) -> dict[str, Any]:
@@ -64,13 +78,9 @@ def _model_device(model: Any) -> torch.device:
 
 
 def _ensure_pad_token(hf_tokenizer: Any) -> None:
-    """Set pad_token to eos_token when the tokenizer has none (common for Qwen/LLaMA).
-    Also enforce left-padding, which is required for decoder-only generation.
-    """
     if hf_tokenizer.pad_token_id is None:
         hf_tokenizer.pad_token = hf_tokenizer.eos_token
         hf_tokenizer.pad_token_id = hf_tokenizer.eos_token_id
-    hf_tokenizer.padding_side = "left"
 
 
 
@@ -81,27 +91,46 @@ def generate_batch(
     hf_tokenizer: Any,
     start_answer_txt: str,
     gen_kwargs: dict[str, Any],
+    model_family: str = "qwen",
+    debug: bool = False,
 ) -> list[str]:
     _ensure_pad_token(hf_tokenizer)
 
-    prompt_ids = []
+    aya_template = AyaChatPromptTemplate(hf_tokenizer) if model_family == "aya" else None
+
+    prompt_ids: list[list[int]] = []
+    prompt_texts: list[str] = []  # raw strings kept for debug printing
     max_len = 0
+    input_text = ""
     try:
         for row in rows:
+            st_answer_txt = None if model_family == "aya" else start_answer_txt
             messages = process_single_row(
                 row,
                 hf_tokenizer,
                 add_answer=False,
-                start_answer_txt=start_answer_txt,
+                start_answer_txt=st_answer_txt,
             )
-            input_text = hf_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            input_text= input_text[:input_text.index(start_answer_txt) + len(start_answer_txt)]
-            inputs = hf_tokenizer.encode(
-                    text=input_text,
-                    add_special_tokens = False,
+            if model_family == "aya":
+                # AyaChatPromptTemplate handles the system prompt internally and
+                # opens the assistant turn with generation=True; drop any assistant
+                # placeholder that process_single_row may have appended.
+                user_messages = [m for m in messages if m["role"] != "assistant"]
+                input_text = aya_template.apply_chat_prompt_template(
+                    user_messages, generation=True
                 )
+                inputs = hf_tokenizer.encode(input_text, add_special_tokens=False)
+            else:
+                input_text = hf_tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
+                )
+                input_text = input_text[
+                    : input_text.index(start_answer_txt) + len(start_answer_txt)
+                ]
+                inputs = hf_tokenizer.encode(input_text, add_special_tokens=False)
             max_len = max(max_len, len(inputs))
             prompt_ids.append(inputs)
+            prompt_texts.append(input_text)
     except Exception as e:
         print(f"Error processing row: {e} within {input_text}")
         traceback.print_exc()
@@ -115,18 +144,23 @@ def generate_batch(
     pad_id = hf_tokenizer.pad_token_id
     for ids in prompt_ids:
         pad_amt = max_len - len(ids)
-        padded_input.append([pad_id] * pad_amt + ids)
-        attention_mask.append([0] * pad_amt + [1] * len(ids))
+        if hf_tokenizer.padding_side == "left":
+            padded_input.append([pad_id] * pad_amt + ids)
+            attention_mask.append([0] * pad_amt + [1] * len(ids))
+        else:
+            padded_input.append(ids + [pad_id] * pad_amt)
+            attention_mask.append([1] * len(ids) + [0] * pad_amt)
 
     batch: dict = {
         "input_ids": torch.tensor(padded_input, dtype=torch.long),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
     }
     dev = _model_device(model)
-    input_ids = batch["input_ids"].to(dev)        # (B, max_prompt_len)
+    input_ids = batch["input_ids"].to(dev)
     attention_mask = batch["attention_mask"].to(dev)
 
     filtered = _filter_generate_kwargs(model, gen_kwargs)
+    filtered["eos_token_id"] = hf_tokenizer.eos_token_id
     output_ids = model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -139,7 +173,19 @@ def generate_batch(
             output_ids[i][max_len:],
             skip_special_tokens=True,
         )
-        results.append(strip_qwen_thinking_tokens(decoded))
+        question = rows[i]["input"]
+        results.append(strip_qwen_thinking_tokens(decoded, question))
+
+    if debug:
+        sep = "─" * 60
+        for i, (prompt, output) in enumerate(zip(prompt_texts, results)):
+            print(f"\n{sep}")
+            print(f"[DEBUG] Sample {i} — INPUT (special tokens kept):")
+            print(prompt)
+            print(f"[DEBUG] Sample {i} — OUTPUT (special tokens stripped):")
+            print(output)
+        print(sep + "\n")
+
     return results
 
 
@@ -164,10 +210,12 @@ def _print_eval_summary(rows: list[dict[str, Any]]) -> None:
     if not rows or "rouge1_f1" not in rows[0]:
         return
     pdf = pd.DataFrame(rows)
-    metric_cols = [c for c in ("rouge1_f1", "rougeL_f1", "score") if c in pdf.columns]
+    metric_cols = [
+        c for c in ("exact_match", "rouge1_f1", "rougeL_f1", "score") if c in pdf.columns
+    ]
 
     print("\n" + "=" * 60)
-    print("EVAL SUMMARY (ROUGE means)")
+    print("EVAL SUMMARY")
     print("=" * 60)
     for col in metric_cols:
         print(f"  {col}: {pdf[col].mean():.4f}")
@@ -203,6 +251,9 @@ def run_eval(args: argparse.Namespace) -> None:
     # CLI max_new_tokens always wins over the JSON file value.
     gen_kwargs = {**gen_from_file, "max_new_tokens": args.max_new_tokens}
 
+    model_family = _detect_model_family(args.model_id)
+    print(f"[eval] Detected model family: '{model_family}'")
+
     if args.adapter_path:
         model, _, hf_tokenizer = get_peft_model(
             args.model_id, dtype=args.dtype, adapter_path=args.adapter_path, add_peft_kwargs=False
@@ -236,6 +287,8 @@ def run_eval(args: argparse.Namespace) -> None:
                 hf_tokenizer,
                 args.start_answer_txt,
                 filtered_once,
+                model_family=model_family,
+                debug=args.debug and batch_idx == 0,
             )
         except Exception as exc:
             tqdm.tqdm.write(f"[WARNING] batch {batch_idx} (rows {start}-{end-1}) failed: {exc}")
@@ -265,6 +318,7 @@ def run_eval(args: argparse.Namespace) -> None:
                     "gen_answer": gen_answer,
                     "expected_lang": lang,
                     "expected_country": country,
+                    "exact_match": int(_compute_exact_match(gen_answer, str(gold))),
                 }
                 rec.update(rouge)
                 rows.append(rec)
@@ -373,6 +427,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Write incremental CSV results here (recommended).",
+    )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Print raw inputs (with special tokens) and stripped outputs for the "
+             "first batch. Useful for verifying the prompt format.",
     )
     return p.parse_args()
 

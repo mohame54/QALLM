@@ -13,12 +13,22 @@ import pandas as pd
 from utils.datasets import QADataset, QADPODataset
 from utils.model import get_peft_model
 from utils.common import download_gdown_file, load_json
-from trainers.sft import Qwen3_5Collator, Mytrainer
+from trainers.sft import AyaCollator, Qwen3_5Collator, Mytrainer
 from trainers.dpo import Qwen3_5DPOTrainer
 from trainers.configs import Qwen3_5SFTConfig, Qwen3_5DPOConfig
 
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _detect_model_family(model_id: str) -> str:
+    """Return 'aya' for Cohere/Aya models, 'qwen' for Qwen models, 'qwen' as default."""
+    mid = model_id.lower()
+    if "aya" in mid:
+        return "aya"
+    if "qwen" in mid:
+        return "qwen"
+    return "qwen"
 
 
 def _sample_stratified(df: pd.DataFrame, n: int, seed: int = 42) -> pd.DataFrame:
@@ -60,6 +70,8 @@ def run_training(args: argparse.Namespace) -> None:
     max_seq_length = args.max_seq_length
     val_sample_size = args.val_sample_size
     eval_steps = args.eval_steps
+    gen_eval_samples = args.gen_eval_samples
+    max_gen_length = args.max_gen_length
     sft_adapter = args.sft_adapter  # DPO only: load SFT LoRA weights, no trainer state
     _ckpt_arg = args.resume_from_checkpoint
     resume_from_checkpoint: bool | str | None = (
@@ -100,7 +112,6 @@ def run_training(args: argparse.Namespace) -> None:
         )
     else:
         _run_sft(
-            args,
             model=model,
             tokenizer=tokenizer,
             hf_tokenizer=hf_tokenizer,
@@ -112,6 +123,9 @@ def run_training(args: argparse.Namespace) -> None:
             val_sample_size=val_sample_size,
             eval_steps=eval_steps,
             resume_from_checkpoint=resume_from_checkpoint,
+            model_id=model_id,
+            gen_eval_samples=gen_eval_samples,
+            max_gen_length=max_gen_length,
         )
 
 
@@ -127,6 +141,9 @@ def _run_sft(
     val_sample_size: int | None,
     eval_steps: int | None,
     resume_from_checkpoint,
+    model_id: str = "",
+    gen_eval_samples: int = 0,
+    max_gen_length: int = 256,
 ) -> None:
     # ── training dataset ─────────────────────────────────────────────────────
     train_dataset = QADataset.from_csv(train_file, hf_tokenizer)
@@ -135,6 +152,7 @@ def _run_sft(
 
     # ── validation dataset (optional) ────────────────────────────────────────
     val_dataset = None
+    val_df = None
     if val_file:
         val_ds = QADataset.from_csv(val_file, hf_tokenizer)
         val_ds.mode("val")
@@ -144,9 +162,16 @@ def _run_sft(
                 f"[train] Validation set: {len(val_ds.df)} samples "
                 f"(stratified from {val_file})"
             )
+        val_df = val_ds.df
         val_dataset = val_ds.to_hf_dataset()
 
-    my_custom_collator = Qwen3_5Collator(hf_tokenizer, max_seq_length=max_seq_length)
+    # ── collator: auto-select based on model family ───────────────────────────
+    model_family = _detect_model_family(model_id)
+    print(f"[train] Detected model family: '{model_family}' from model_id='{model_id}'")
+    if model_family == "aya":
+        my_custom_collator = AyaCollator(hf_tokenizer, max_seq_length=max_seq_length)
+    else:
+        my_custom_collator = Qwen3_5Collator(hf_tokenizer, max_seq_length=max_seq_length)
 
     sft_config = Qwen3_5SFTConfig.from_json(trainer_kwargs_path)
 
@@ -164,6 +189,10 @@ def _run_sft(
         eval_dataset=val_dataset,
         args=sft_config,
         sampling_alpha=sampling_alpha,
+        gen_eval_samples=gen_eval_samples,
+        max_gen_length=max_gen_length,
+        val_df=val_df,
+        model_family=model_family,
     )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
@@ -271,6 +300,21 @@ if __name__ == "__main__":
         default=None,
         help="Run validation every N optimizer steps. "
              "Requires --val_file or --gdrive_val_file_id.",
+    )
+    parser.add_argument(
+        "--gen_eval_samples",
+        type=int,
+        default=0,
+        help="Number of samples to generate during each evaluation pass for "
+             "generation-based metrics (exact-match, ROUGE). "
+             "0 disables generation eval. Requires --val_file.",
+    )
+    parser.add_argument(
+        "--max_gen_length",
+        type=int,
+        default=256,
+        help="Maximum number of new tokens to generate per sample during "
+             "generation-based evaluation. Default 256.",
     )
 
     # ── model & training ─────────────────────────────────────────────────────
