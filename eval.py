@@ -93,6 +93,7 @@ def generate_batch(
     gen_kwargs: dict[str, Any],
     model_family: str = "qwen",
     debug: bool = False,
+    debug_n: int = 0,
 ) -> list[str]:
     _ensure_pad_token(hf_tokenizer)
 
@@ -177,13 +178,17 @@ def generate_batch(
         results.append(strip_qwen_thinking_tokens(decoded, question))
 
     if debug:
+        n_to_print = len(rows) if debug_n <= 0 else min(debug_n, len(rows))
         sep = "─" * 60
-        for i, (prompt, output) in enumerate(zip(prompt_texts, results)):
+        for i in range(n_to_print):
+            raw_output = hf_tokenizer.decode(
+                output_ids[i][max_len:], skip_special_tokens=False
+            )
             print(f"\n{sep}")
             print(f"[DEBUG] Sample {i} — INPUT (special tokens kept):")
-            print(prompt)
-            print(f"[DEBUG] Sample {i} — OUTPUT (special tokens stripped):")
-            print(output)
+            print(prompt_texts[i])
+            print(f"[DEBUG] Sample {i} — OUTPUT (special tokens kept):")
+            print(raw_output)
         print(sep + "\n")
 
     return results
@@ -273,6 +278,7 @@ def run_eval(args: argparse.Namespace) -> None:
     labels = ["TargetRLF1", "TargetR1F1", "TargetLLM"]
     batch_size = args.batch_size
     n_batches = (len(df) + batch_size - 1) // batch_size
+    debug_samples_remaining = args.debug_samples if args.debug else 0
 
     for batch_idx in tqdm.tqdm(range(n_batches), desc=args.mode):
         start = batch_idx * batch_size
@@ -288,12 +294,14 @@ def run_eval(args: argparse.Namespace) -> None:
                 args.start_answer_txt,
                 filtered_once,
                 model_family=model_family,
-                debug=args.debug and batch_idx == 0,
+                debug=debug_samples_remaining > 0,
+                debug_n=debug_samples_remaining,
             )
         except Exception as exc:
             tqdm.tqdm.write(f"[WARNING] batch {batch_idx} (rows {start}-{end-1}) failed: {exc}")
             gen_answers = [""] * len(batch_rows)
             print(traceback.format_exc())
+        debug_samples_remaining = max(0, debug_samples_remaining - len(batch_rows))
 
         for row, idx, gen_answer in zip(batch_rows, global_indices, gen_answers):
             if not gen_answer.strip():
@@ -432,8 +440,14 @@ def parse_args() -> argparse.Namespace:
         "--debug",
         action="store_true",
         default=False,
-        help="Print raw inputs (with special tokens) and stripped outputs for the "
-             "first batch. Useful for verifying the prompt format.",
+        help="Print raw inputs and outputs (special tokens kept) for the first "
+             "--debug_samples samples. Useful for verifying the prompt format.",
+    )
+    p.add_argument(
+        "--debug_samples",
+        type=int,
+        default=5,
+        help="Number of samples to print when --debug is set (default: 5).",
     )
     return p.parse_args()
 
