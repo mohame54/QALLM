@@ -7,23 +7,34 @@ from utils.hf import download_checkpoint_from_hf
 from utils.aya import load_lora_extended_model
 from utils.common import download_gdown_file, load_json
 from utils.instructions import AyaChatPromptTemplate, process_single_row
+from utils.text import clean
 
 warnings.filterwarnings("ignore")
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 
+MAX_LENS_SUBSET = {
+    'Aka_Gha': 512,
+     'Amh_Eth': 128,
+     'Eng_Eth': 64,
+     'Eng_Gha': 180,
+     'Eng_Ken': 205,
+     'Eng_Uga': 312,
+    'Lug_Uga': 511,
+    'Swa_Ken': 347
+}
+
 
 def main(args):
     adapter_path = args.adapter_path
-    if  args.hf_checkpoint:
+    if args.hf_checkpoint:
         if not args.repo_id:
             raise ValueError("repo_id must be provided when hf_checkpoint is specified.")
-        download_checkpoint_from_hf(
+        adapter_path = download_checkpoint_from_hf(
             repo_id=args.repo_id,
             checkpoint_dir=args.hf_checkpoint,
             local_dir=".",
         )
-        adapter_path = args.hf_checkpoint
     
     if not adapter_path:
         raise ValueError("Either hf_checkpoint or adapter_path must be provided.")
@@ -39,12 +50,6 @@ def main(args):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     aya_chat_template = AyaChatPromptTemplate(tokenizer)
-
-    all_messages = []
-    all_gens = []
-    all_ids = []
-    batch_sz = args.batch_sz
-    max_len = 0
     if args.gdrive_id:
         test_df_path = download_gdown_file(args.gdrive_id, args.test_data_path)
     else:
@@ -53,11 +58,51 @@ def main(args):
     if not os.path.exists(test_df_path):
        raise FileNotFoundError(f"Test data file not found at {test_df_path}. Please check the path or gdrive_id.")
     test_df = pd.read_csv(test_df_path)
-    for _, row in test_df.iterrows():
+    
+    results = []
+    global_gen_kwargs = load_json(os.path.join(CUR_DIR, "configs", "gen.json"))
+    for subset in test_df['subset'].unique():
+        sub_df = test_df[test_df['subset'] == subset]
+        gen_kwargs = global_gen_kwargs.copy()
+        gen_kwargs.update({'max_new_tokens': MAX_LENS_SUBSET[subset]})
+        print(f"Generating for subset {subset} with kwargs: {gen_kwargs}")
+        results.append(
+            generate_with_subset(
+                sub_df=sub_df,
+                tokenizer=tokenizer,
+                aya_chat_template=aya_chat_template,
+                gen_kwargs=gen_kwargs,
+                batch_sz=args.batch_sz,
+                model=model,
+                min_n_grams=args.min_n_grams,
+                max_n_grams=args.max_n_grams,
+                max_passes=args.max_passes
+            )
+        )
+
+    results_df = pd.concat(results)
+    results_df.to_csv(args.save_file_path, index=False)
+
+
+def generate_with_subset(
+    sub_df,
+    tokenizer,
+    aya_chat_template,
+    gen_kwargs,
+    batch_sz,
+    model,
+    min_n_grams=3,
+    max_n_grams=8,
+    max_passes=10
+):
+    all_messages = []
+    all_gens = []
+    all_ids = []
+    for _, row in sub_df.iterrows():
         all_messages.append(process_single_row(row, tokenizer, add_answer=False))
         all_ids.append(row["ID"])
 
-    gen_kwargs = load_json(os.path.join(CUR_DIR, "configs", "gen.json"))
+    max_len = 0
     pgbar = tqdm.tqdm(range(0, len(all_messages), batch_sz), desc="Generating the data")
     for i in pgbar:
         batch_messages = all_messages[i : i + batch_sz]
@@ -79,13 +124,21 @@ def main(args):
             **gen_kwargs,
             eos_token_id=aya_chat_template.stop_token_ids(),
         )
-        gen_ids = ids[:, :prompt_length]
+        gen_ids = ids[:, prompt_length:]
         max_len = max(gen_ids.shape[1], max_len)
         gens = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         gens = [
-            gens[j].replace(test_df.iloc[i + j]["input"], "").strip()
+            gens[j].replace(sub_df.iloc[i + j]["input"], "").strip()
             for j in range(len(gens))
         ]
+        gens = [
+            remove_repeated_ngrams(
+                tokenizer,
+                gen, 
+                min_n=min_n_grams, 
+                max_n=max_n_grams, 
+                max_passes=max_passes
+            ) for gen in gens]
         all_gens.extend(gens)
         pgbar.set_postfix({"Latest Gen": gens[0], "Max Gen Len": max_len})
 
@@ -94,8 +147,7 @@ def main(args):
     }
     labels = ["TargetRLF1", "TargetR1F1", "TargetLLM"]
     data.update({l: all_gens for l in labels})
-    results_df = pd.DataFrame(data)
-    results_df.to_csv(args.save_file_path, index=False)
+    return pd.DataFrame(data)
 
 
 def parse_args():
@@ -148,6 +200,24 @@ def parse_args():
         type=str,
         default="Muhammed164/SDFT",
         help="Hugging Face repo ID for the checkpoint (required if --hf_checkpoint is specified).",
+    )
+    parser.add_argument(
+        "--min_n_grams",
+        type=int,
+        default=3,
+        help="Minimum n-gram length to remove.",
+    )
+    parser.add_argument(
+        "--max_n_grams",
+        type=int,
+        default=8,
+        help="Maximum n-gram length to remove.",
+    )
+    parser.add_argument(
+        "--max_passes",
+        type=int,
+        default=10,
+        help="Maximum number of passes to remove n-grams.",
     )
     return parser.parse_args()
 
