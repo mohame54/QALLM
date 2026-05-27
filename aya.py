@@ -24,7 +24,16 @@ MAX_LENS_SUBSET = {
     'Swa_Ken': 347
 }
 
-
+MAX_LENS_SUBSET_2 = {
+    "Swa_Ken": 500,
+    "Lug_Uga": 650,
+    "Aka_Gha": 500,
+    "Amh_Eth": 200,
+    "Eng_Eth": 80,
+    "Eng_Uga": 420,
+    "Eng_Gha": 300,
+    "Eng_Ken": 312,
+}
 def main(args):
     adapter_path = args.adapter_path
     if args.hf_checkpoint:
