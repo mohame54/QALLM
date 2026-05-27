@@ -7,7 +7,7 @@ from utils.hf import download_checkpoint_from_hf
 from utils.aya import load_lora_extended_model
 from utils.common import download_gdown_file, load_json
 from utils.instructions import AyaChatPromptTemplate, process_single_row
-from utils.text import clean
+from utils.text import remove_repeated_ngrams
 
 warnings.filterwarnings("ignore")
 
