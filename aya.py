@@ -1,6 +1,5 @@
 import argparse
 import os
-from types import NoneType
 import warnings
 import pandas as pd
 import tqdm
@@ -146,7 +145,6 @@ def generate_with_subset(
         ).to(next(model.parameters()).device)
 
         prompt_length = inputs["input_ids"].shape[1]
-        gen_kwargs['max_length'] = None
         ids = model.generate(
             **inputs,
             **gen_kwargs,
